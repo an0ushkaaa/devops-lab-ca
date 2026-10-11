@@ -1,0 +1,372 @@
+# =============================================================================
+# docker-compose.yml — devops-lab-ca full stack
+#
+# Services
+#   app           Node.js / Express API (Phase 1)
+#   elasticsearch Single-node ES 8.x, security disabled for dev
+#   kibana        Kibana 8.x, connected to ES
+#   logstash      Logstash 8.x, Beats -> JSON parse -> ES
+#   filebeat      Ships Docker container logs to Logstash
+#
+# Network : elk-net (bridge)
+# Volumes : es-data (ES persistence), app-logs (Winston file logs)
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Node.js / Express API
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: devops-lab-ca:latest
+    container_name: devops-lab-ca-app
+    networks:
+      - elk-net
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    volumes:
+      - app-logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+    # ── Docker logging driver ────────────────────────────────────────────────
+    # json-file writes each stdout/stderr line as a JSON object under
+    # /var/lib/docker/containers/<id>/<id>-json.log — exactly the path
+    # Filebeat's autodiscover input watches.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # ── Filebeat autodiscover hints ──────────────────────────────────────────
+    # Filebeat's Docker autodiscover provider watches the Docker event stream.
+    # When it sees a container start it reads labels prefixed co.elastic.logs/
+    # and uses them to build an input configuration on the fly — no static
+    # path globs needed.
+    #
+    # Label reference:
+    #   enabled          — opt this container in to log collection
+    #   json.*           — teach Filebeat how to decode Winston's JSON lines
+    #   fields.*         — extra key-value pairs merged into every log event
+    #   tags             — array (comma-separated string) added to event.tags
+    #   multiline.*      — not needed; Winston emits one JSON object per line
+    labels:
+      # Core opt-in — Filebeat ignores containers without this label.
+      co.elastic.logs/enabled: "true"
+
+      # Winston emits one complete JSON object per line; instruct Filebeat to
+      # decode it and merge all keys directly onto the root of the event
+      # (keys_under_root: true) rather than nesting them under a "json" key.
+      co.elastic.logs/json.keys_under_root: "true"
+
+      # "message" is the field Winston writes the human-readable text into.
+      # Filebeat promotes this to the ECS "message" field after decoding.
+      co.elastic.logs/json.message_key: "message"
+
+      # Surface any JSON-decode errors as a dedicated field so they are
+      # visible in Kibana rather than silently dropped.
+      co.elastic.logs/json.add_error_key: "true"
+
+      # Overwrite the raw "message" field with the decoded value so there
+      # is no duplicate of the original unparsed JSON string in the event.
+      co.elastic.logs/json.overwrite_keys: "true"
+
+      # ── Custom fields merged into every event from this container ──────────
+      # These arrive in Logstash as top-level fields and are indexed into ES.
+      co.elastic.logs/fields.service_name: "devops-lab-ca"
+      co.elastic.logs/fields.service_version: "1.0.0"
+      co.elastic.logs/fields.environment: "production"
+      co.elastic.logs/fields.language: "nodejs"
+
+      # ── Tags ─────────────────────────────────────────────────────────────
+      # Comma-separated; Filebeat expands into the event.tags array.
+      # Logstash can filter on these without needing to parse field values.
+      co.elastic.logs/tags: "nodejs,express,app"
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch 8.x — single node, security disabled (dev only)
+  #
+  # xpack.security.enabled=false removes the need for TLS certs and API keys,
+  # which is appropriate for a local dev / lab environment.
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: devops-lab-ca-es
+    networks:
+      - elk-net
+    environment:
+      # Single-node discovery — no cluster formation needed.
+      - discovery.type=single-node
+
+      # Disable X-Pack security (no TLS, no auth) for dev convenience.
+      - xpack.security.enabled=false
+
+      # Disable X-Pack ML to save memory on dev machines.
+      - xpack.ml.enabled=false
+
+      # JVM heap: set both -Xms and -Xmx to the same value to avoid
+      # heap resizing pauses. 512 m is enough for a single-node dev cluster.
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+
+      # Bootstrap checks are relaxed for single-node dev setups.
+      - bootstrap.memory_lock=false
+
+      # Cluster and node identity.
+      - cluster.name=devops-lab-cluster
+      - node.name=es-node-01
+    ports:
+      # REST API
+      - "9200:9200"
+      # Transport (inter-node, not needed in single-node but exposed for tooling)
+      - "9300:9300"
+    volumes:
+      # Named volume so index data survives container restarts.
+      - es-data:/usr/share/elasticsearch/data
+    ulimits:
+      # ES requires memlock to be unlimited for optimal performance.
+      memlock:
+        soft: -1
+        hard: -1
+      # Open file descriptor limit.
+      nofile:
+        soft: 65536
+        hard: 65536
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          curl -fsSL http://localhost:9200/_cluster/health \
+            | grep -qE '"status":"(green|yellow)"'
+      interval: 20s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Kibana 8.x
+  # ---------------------------------------------------------------------------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: devops-lab-ca-kibana
+    networks:
+      - elk-net
+    environment:
+      # Point Kibana at the ES container by its service-name DNS entry.
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+
+      # Disable telemetry and news feed for cleaner dev experience.
+      - TELEMETRY_ENABLED=false
+      - NEWSFEED_ENABLED=false
+
+      # Server host — bind to all interfaces so the port mapping works.
+      - SERVER_HOST=0.0.0.0
+      - SERVER_NAME=devops-lab-kibana
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          curl -fsSL http://localhost:5601/api/status \
+            | grep -q '"level":"available"'
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 1G
+        reservations:
+          cpus: "0.10"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Logstash 8.x
+  #
+  # Receives Beats events on 5044, parses Winston JSON, ships to ES.
+  # The pipeline config is bind-mounted so changes take effect on container
+  # restart without rebuilding the image.
+  # ---------------------------------------------------------------------------
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.4
+    container_name: devops-lab-ca-logstash
+    networks:
+      - elk-net
+    environment:
+      # JVM heap for Logstash.
+      - LS_JAVA_OPTS=-Xms256m -Xmx256m
+
+      # Disable X-Pack monitoring so Logstash doesn't try to push metrics
+      # to ES using credentials (which don't exist in security-disabled mode).
+      - MONITORING_ENABLED=false
+
+      # Expose for logstash.conf's ${APP_ENV} variable substitution.
+      - APP_ENV=development
+    ports:
+      # Beats input (Filebeat -> Logstash).
+      - "5044:5044"
+      # Logstash metrics API (optional, useful for debugging).
+      - "9600:9600"
+    volumes:
+      # Bind-mount the pipeline so edits are picked up on container restart.
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          curl -fsSL http://localhost:9600/?pretty \
+            | grep -q '"status" : "green"'
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Filebeat 8.x
+  #
+  # Reads Docker container log files from the host, annotates them with
+  # container metadata (via the Docker socket), then ships to Logstash.
+  #
+  # Security note: the Docker socket mount gives Filebeat read access to the
+  # daemon's API. In production, use a dedicated read-only socket proxy.
+  # ---------------------------------------------------------------------------
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.13.4
+    container_name: devops-lab-ca-filebeat
+    # Must run as root to read /var/lib/docker/containers (owned by root on
+    # the host). Filebeat drops privileges after opening the files.
+    user: root
+    networks:
+      - elk-net
+    environment:
+      # Strict permission check on filebeat.yml would fail because the
+      # bind-mounted file is owned by the Windows/host user. Disable it.
+      - FILEBEAT_STRICT_PERMS=false
+    command:
+      - filebeat
+      - -e
+      # Disable the strict permission check via CLI flag (belt-and-suspenders).
+      - --strict.perms=false
+      - -c
+      - /usr/share/filebeat/filebeat.yml
+    volumes:
+      # Configuration file.
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+
+      # Docker container log files (read-only — Filebeat only reads them).
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+
+      # Docker daemon socket so add_docker_metadata can query container info.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+      # Persist Filebeat's registry (tracks which log lines have been shipped)
+      # so it doesn't re-ship everything on container restart.
+      - filebeat-registry:/usr/share/filebeat/data
+    depends_on:
+      logstash:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  elk-net:
+    name: elk-net
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  # Elasticsearch index data — survives container restarts/upgrades.
+  es-data:
+    name: devops-lab-ca-es-data
+    driver: local
+
+  # Winston file-transport logs from the app container.
+  app-logs:
+    name: devops-lab-ca-app-logs
+    driver: local
+
+  # Filebeat registry — tracks shipped log offsets to prevent re-shipping.
+  filebeat-registry:
+    name: devops-lab-ca-filebeat-registry
+    driver: local

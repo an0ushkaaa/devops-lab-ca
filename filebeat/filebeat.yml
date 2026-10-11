@@ -1,0 +1,131 @@
+# =============================================================================
+# Filebeat configuration — devops-lab-ca
+#
+# Uses Docker autodiscover with hints so Filebeat dynamically configures an
+# input for any container that carries a co.elastic.logs/enabled: "true" label.
+# No static path globs — the pipeline self-configures as containers come and go.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Autodiscover — Docker provider with hints
+#
+# How it works
+# ─────────────
+# 1. Filebeat connects to the Docker socket and subscribes to container events
+#    (start / stop / die).
+# 2. On every "start" event it reads all labels on the container.
+# 3. Labels prefixed with "co.elastic.logs/" are translated into Filebeat
+#    input configuration keys (the "hints" protocol).
+# 4. Filebeat builds and activates an input for that container on the fly.
+# 5. When the container stops, Filebeat tears down the input automatically.
+#
+# Hint label → input config mapping (key examples)
+# ──────────────────────────────────────────────────
+#   co.elastic.logs/enabled            → enabled (boolean gate)
+#   co.elastic.logs/json.*             → json.* options on the input
+#   co.elastic.logs/fields.*           → fields.* merged into every event
+#   co.elastic.logs/tags               → tags list
+#   co.elastic.logs/multiline.*        → multiline.* options
+# -----------------------------------------------------------------------------
+filebeat.autodiscover:
+  providers:
+    - type: docker
+      # Connect to the Docker socket (bind-mounted into the container).
+      host: "unix:///var/run/docker.sock"
+
+      # Enable hints-based configuration so container labels drive input setup.
+      hints.enabled: true
+
+      # default_config is applied to every discovered container UNLESS the
+      # container carries a co.elastic.logs/enabled: "true" label that
+      # activates a hints-generated config.  Setting enabled: false here means
+      # Filebeat will NOT collect from containers that have no hints — only
+      # the app container (and anything else you deliberately opt in) is tailed.
+      hints.default_config:
+        type: container
+        enabled: false
+        paths:
+          - /var/lib/docker/containers/${data.container.id}/*.log
+
+      # Scope to containers that have explicitly opted in.
+      # This condition is evaluated before hints are read; containers without
+      # the label are ignored entirely (no spurious "no input" log spam).
+      condition:
+        equals:
+          docker.container.labels.co.elastic.logs/enabled: "true"
+
+      # ── Global processors applied to every autodiscovered input ─────────────
+      # These run after the per-input processors built from hints.
+      processors:
+        # Attach full Docker container metadata (name, image, compose labels,
+        # network settings) to every event using the container ID.
+        - add_docker_metadata:
+            host: "unix:///var/run/docker.sock"
+
+        # Add the host's own metadata (hostname, OS, architecture) so events
+        # from different machines can be distinguished in a multi-host setup.
+        - add_host_metadata:
+            when.not.contains.tags: forwarded
+
+        # Normalise log.level from Winston's "level" field into the ECS
+        # log.level field so Kibana's log explorer works without custom config.
+        - copy_fields:
+            fields:
+              - from: level
+                to: log.level
+            fail_on_error: false
+            ignore_missing: true
+
+        # Drop internal ECS housekeeping fields that Logstash will discard
+        # anyway — saves bandwidth and reduces event size.
+        - drop_fields:
+            fields: ["agent.ephemeral_id", "ecs.version"]
+            ignore_missing: true
+
+# -----------------------------------------------------------------------------
+# Output — Logstash
+#
+# Using the Beats output (not Elasticsearch directly) so Logstash can apply
+# its enrichment / transformation pipeline before indexing.
+# -----------------------------------------------------------------------------
+output.logstash:
+  hosts: ["logstash:5044"]
+
+  # Compress events in transit (reduces bandwidth, slight CPU cost).
+  compression_level: 3
+
+  # Number of events to batch before flushing to Logstash.
+  bulk_max_size: 512
+
+  # Retry failed batches up to 3 times before dropping.
+  max_retries: 3
+
+  # Wait up to 60 s for a Logstash response before timing out.
+  timeout: 60
+
+# -----------------------------------------------------------------------------
+# Logging — Filebeat's own operational logs
+# -----------------------------------------------------------------------------
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat
+  name: filebeat
+  keepfiles: 3
+  permissions: 0600
+
+# Emit JSON-structured logs so they can be ingested too if needed.
+logging.json: true
+
+# -----------------------------------------------------------------------------
+# Queue — in-memory queue to absorb bursts
+# -----------------------------------------------------------------------------
+queue.mem:
+  events: 4096
+  flush.min_events: 512
+  flush.timeout: 5s
+
+# -----------------------------------------------------------------------------
+# Monitoring — disable X-Pack monitoring for dev (requires licensed ES).
+# -----------------------------------------------------------------------------
+monitoring.enabled: false

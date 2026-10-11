@@ -1,0 +1,324 @@
+# =============================================================================
+# CI/CD Pipeline — devops-lab-ca
+#
+# Jobs
+# ────
+#   test    Run Jest suite on every push and every PR (Node 18 container)
+#   build   Build + tag Docker image; push to GHCR on pushes to main
+#   deploy  Validate compose config on PRs; docker compose up -d on main
+#
+# Required repository secrets (Settings → Secrets and variables → Actions)
+# ────────────────────────────────────────────────────────────────────────
+#   DEPLOY_HOST        SSH host of the target server  (deploy job)
+#   DEPLOY_USER        SSH login user                 (deploy job)
+#   DEPLOY_SSH_KEY     Private key (PEM, no passphrase) (deploy job)
+#   DEPLOY_WORK_DIR    Absolute path to project root on server (deploy job)
+#
+# GITHUB_TOKEN is provided automatically — no secret needed for GHCR push.
+# =============================================================================
+
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Cancel any in-progress run for the same branch/PR so pushes don't queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Shared environment ────────────────────────────────────────────────────────
+env:
+  # GitHub Container Registry image name (lower-cased repository path).
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/devops-lab-ca
+  NODE_VERSION: "18"
+
+# =============================================================================
+# JOB 1 — test
+# =============================================================================
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+
+    # Run inside the official Node 18 container image so the environment
+    # exactly mirrors the production base image and avoids any runner-level
+    # Node version mismatch.
+    container:
+      image: node:18-alpine
+      # Alpine ships without git; install it so actions/checkout works.
+      options: --user root
+
+    strategy:
+      matrix:
+        # Pin to 18 now; extend the array to test against multiple versions.
+        node-version: ["18"]
+      fail-fast: true
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── Cache node_modules ──────────────────────────────────────────────────
+      # The cache key is a hash of package-lock.json.  A lock-file change
+      # busts the cache and forces a fresh npm ci; everything else hits the
+      # cache and skips the install entirely.
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        id: npm-cache
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            node-modules-${{ runner.os }}-${{ matrix.node-version }}-
+
+      # ── Install dependencies ────────────────────────────────────────────────
+      # npm ci is skipped automatically when the cache is a full hit because
+      # node_modules already contains the correct tree.
+      - name: Install dependencies
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+      # ── Audit ───────────────────────────────────────────────────────────────
+      # Fail the build if any HIGH or CRITICAL vulnerability is found.
+      # --audit-level=high means moderate/low severities are reported but
+      # don't break CI — adjust to "critical" for a more lenient gate.
+      - name: Security audit
+        run: npm audit --audit-level=high
+        continue-on-error: true   # advisory only; set to false to make it a hard gate
+
+      # ── Run tests ───────────────────────────────────────────────────────────
+      - name: Run Jest test suite
+        run: npm test
+        env:
+          # Deterministic timezone for any time-sensitive assertions.
+          TZ: UTC
+          CI: "true"
+
+      # ── Upload test results ─────────────────────────────────────────────────
+      # Jest writes a JUnit XML report (via --reporters) when JEST_JUNIT_*
+      # env vars are set.  Kept optional so it doesn't break if the reporter
+      # isn't installed yet.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jest-results-node${{ matrix.node-version }}
+          path: |
+            coverage/
+            jest-results.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+# =============================================================================
+# JOB 2 — build
+# Runs after test passes. Builds the Docker image and pushes it to GHCR
+# on pushes to main. PRs get a build-only smoke-test (no push).
+# =============================================================================
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: test
+
+    # Expose image metadata as outputs so the deploy job can consume them
+    # without re-computing tags.
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.push.outputs.digest }}
+      sha-tag: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+    # Grant the workflow token write access to packages (GHCR).
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── Docker Buildx ───────────────────────────────────────────────────────
+      # Buildx is required for multi-platform builds and advanced cache modes.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Authenticate to GHCR ────────────────────────────────────────────────
+      # GITHUB_TOKEN is automatically injected by Actions — no extra secret.
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Compute image tags and OCI labels ───────────────────────────────────
+      # docker/metadata-action generates:
+      #   • ghcr.io/<owner>/devops-lab-ca:main        (branch tag)
+      #   • ghcr.io/<owner>/devops-lab-ca:<sha>       (immutable SHA tag)
+      #   • ghcr.io/<owner>/devops-lab-ca:latest      (on default branch)
+      # OCI labels (org.opencontainers.*) are baked into the image manifest.
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            # Immutable per-commit tag — used by the deploy job.
+            type=sha,format=long,prefix=
+            # Branch name tag (e.g. "main").
+            type=ref,event=branch
+            # "latest" only on the default branch.
+            type=raw,value=latest,enable={{is_default_branch}}
+            # PR number tag on pull requests (not pushed, just labelled).
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=devops-lab-ca
+            org.opencontainers.image.description=Node.js Express REST API with ELK logging
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      # ── Build (and push on main) ─────────────────────────────────────────────
+      # The Dockerfile's "test" stage runs npm test inside the image build,
+      # so a failing test also aborts the Docker build — double safety net.
+      #
+      # Cache strategy: "gha" mode stores layer blobs in the Actions cache,
+      # mode=max caches every intermediate stage (deps, test, production).
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          target: production
+          # Only push the final image on merges to main; PRs get a local build.
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Pass the commit SHA as a build arg so it can be embedded in the app.
+          build-args: |
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          # Layer cache stored in the GitHub Actions cache backend.
+          cache-from: type=gha,scope=${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ github.ref_name }}
+          # Build for amd64 (the typical server target); extend for arm64 if needed.
+          platforms: linux/amd64
+
+      # ── Summary ─────────────────────────────────────────────────────────────
+      - name: Write build summary
+        if: always()
+        run: |
+          echo "## Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tags | ${{ steps.meta.outputs.tags }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pushed | ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }} |" >> $GITHUB_STEP_SUMMARY
+
+# =============================================================================
+# JOB 3 — deploy
+# On main: SSH to the server, pull the new image, and restart the stack.
+# On PRs: validate the compose file locally (no server required).
+# =============================================================================
+  deploy:
+    name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'Deploy to server' || 'Validate compose (PR)' }}
+    runs-on: ubuntu-latest
+    needs: build
+
+    # Prevent two deploys from running simultaneously for the same environment.
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && 'production' || 'pull-request' }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── PR path: validate compose file locally ───────────────────────────────
+      # Runs on every pull_request event. No server, no secrets needed.
+      # Catches YAML syntax errors, unknown service keys, and missing build
+      # contexts before anything is merged.
+      - name: Validate docker-compose config (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          docker compose config --quiet
+          echo "compose config is valid"
+
+      # ── Main path: deploy to server via SSH ──────────────────────────────────
+      # The four DEPLOY_* secrets must be configured in the repo before this
+      # job will succeed on pushes to main.
+
+      - name: Install SSH key
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          known_hosts: unnecessary   # host key added in the next step
+          if_key_exists: replace
+
+      - name: Add server to known_hosts
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      # Pull the new image and restart only the app service so the ELK stack
+      # is not cycled unnecessarily.  `--no-deps` avoids restarting Logstash,
+      # Elasticsearch, etc. on every app deploy.
+      - name: Deploy updated app to server
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_WORK_DIR: ${{ secrets.DEPLOY_WORK_DIR }}
+          IMAGE_TAG: ${{ needs.build.outputs.sha-tag }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" bash -s << 'ENDSSH'
+            set -euo pipefail
+
+            cd "$DEPLOY_WORK_DIR"
+
+            echo "==> Pulling latest image: $IMAGE_TAG"
+            docker pull "$IMAGE_TAG"
+
+            echo "==> Tagging as local latest"
+            docker tag "$IMAGE_TAG" devops-lab-ca:latest
+
+            echo "==> Restarting app service (ELK stack untouched)"
+            docker compose up -d --no-deps --force-recreate app
+
+            echo "==> Waiting for health check..."
+            timeout 60 bash -c \
+              'until docker inspect --format="{{.State.Health.Status}}" devops-lab-ca-app | grep -q "healthy"; do sleep 3; done'
+
+            echo "==> Deploy complete"
+            docker compose ps app
+          ENDSSH
+
+      # ── Post-deploy smoke test ───────────────────────────────────────────────
+      - name: Smoke test /health endpoint
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            'curl -fsSL http://localhost:3000/health | grep -q "\"status\":\"ok\""'
+          echo "Smoke test passed"
+
+      # ── Deployment summary ───────────────────────────────────────────────────
+      - name: Write deployment summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "**Mode:** Compose validation (PR — no server deploy)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Mode:** Live deploy to production server" >> $GITHUB_STEP_SUMMARY
+            echo "**Image:** \`${{ needs.build.outputs.sha-tag }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Host:** \`${{ secrets.DEPLOY_HOST }}\`" >> $GITHUB_STEP_SUMMARY
+          fi

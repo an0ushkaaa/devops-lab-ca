@@ -1,0 +1,25 @@
+# Normalise all text files to LF in the repository.
+# On checkout, Windows gets CRLF for files that benefit from it;
+# shell scripts and Docker/config files always stay LF.
+
+# Default: auto-normalise text files
+* text=auto
+
+# Shell scripts must always be LF so they execute correctly on Linux/macOS
+*.sh        text eol=lf
+
+# Docker and config files — keep LF
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.conf      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.js        text eol=lf
+*.gitignore text eol=lf
+
+# Binary files — no line-ending conversion
+*.png binary
+*.jpg binary
+*.pdf binary
+*.zip binary
