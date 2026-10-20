@@ -306,6 +306,7 @@ services:
       # Strict permission check on filebeat.yml would fail because the
       # bind-mounted file is owned by the Windows/host user. Disable it.
       - FILEBEAT_STRICT_PERMS=false
+      - DOCKER_API_VERSION=1.44
     command:
       - filebeat
       - -e
