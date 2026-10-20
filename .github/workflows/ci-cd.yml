@@ -231,6 +231,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
 
+    env:
+      # Deploy only runs when a DEPLOY_HOST secret is configured.
+      DEPLOY_ENABLED: ${{ secrets.DEPLOY_HOST != '' }}
+
     # Prevent two deploys from running simultaneously for the same environment.
     environment:
       name: ${{ github.ref == 'refs/heads/main' && 'production' || 'pull-request' }}
@@ -254,7 +258,7 @@ jobs:
       # job will succeed on pushes to main.
 
       - name: Install SSH key
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.DEPLOY_ENABLED == 'true'
         uses: shimataro/ssh-key-action@v2
         with:
           key: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -262,7 +266,7 @@ jobs:
           if_key_exists: replace
 
       - name: Add server to known_hosts
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.DEPLOY_ENABLED == 'true'
         run: |
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
 
@@ -270,7 +274,7 @@ jobs:
       # is not cycled unnecessarily.  `--no-deps` avoids restarting Logstash,
       # Elasticsearch, etc. on every app deploy.
       - name: Deploy updated app to server
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.DEPLOY_ENABLED == 'true'
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -301,7 +305,7 @@ jobs:
 
       # ── Post-deploy smoke test ───────────────────────────────────────────────
       - name: Smoke test /health endpoint
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.DEPLOY_ENABLED == 'true'
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -317,6 +321,8 @@ jobs:
           echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "**Mode:** Compose validation (PR — no server deploy)" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$DEPLOY_ENABLED" != "true" ]]; then
+            echo "**Mode:** Deploy skipped (no DEPLOY_HOST secret configured; image was built and pushed)" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Mode:** Live deploy to production server" >> $GITHUB_STEP_SUMMARY
             echo "**Image:** \`${{ needs.build.outputs.sha-tag }}\`" >> $GITHUB_STEP_SUMMARY
